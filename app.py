@@ -4,10 +4,17 @@ from datetime import datetime
 
 import streamlit as st
 
+from noticlean.calendar_export import build_ics, calendar_filename
 from noticlean.llm import LLMConfig, enhance_result
 from noticlean.ocr import OCRUnavailableError, ocr_image
 from noticlean.parser import parse_text
-from noticlean.render import UNRELATED_MESSAGE, render_card, render_markdown, result_to_json
+from noticlean.render import (
+    UNRELATED_MESSAGE,
+    render_card,
+    render_markdown,
+    render_priority_badge,
+    result_to_json,
+)
 
 SAMPLE_TEXT = """@所有人
 【2026华为开发者大赛报名】
@@ -127,7 +134,7 @@ def run_parser(text: str) -> None:
         result = parse_text(text, reference)
         if use_llm and result.relevant:
             config = LLMConfig(llm_base_url, llm_model, llm_api_key)
-            result = enhance_result(result, config)
+            result = enhance_result(result, config, reference)
     st.session_state.parse_result = result
 
 
@@ -197,7 +204,21 @@ if result is not None:
             st.warning(f"🚨 【安全提示】：{result.safety_warning}")
         for index, card in enumerate(result.notices, 1):
             with st.container(border=True):
+                st.markdown(render_priority_badge(card), unsafe_allow_html=True)
                 st.markdown(render_card(card, index if len(result.notices) > 1 else None))
+        calendar_cards = [(index, card) for index, card in enumerate(result.notices, 1) if card.calendar_ready]
+        if calendar_cards:
+            st.subheader("日历提醒")
+            st.caption("日历时间来自大模型解析；精确时间生成 30 分钟事件，仅日期生成全天事件。")
+            for index, card in calendar_cards:
+                st.download_button(
+                    f"下载 {card.event_name}（.ics）",
+                    data=build_ics(card).encode("utf-8"),
+                    file_name=calendar_filename(card, index),
+                    mime="text/calendar; charset=utf-8",
+                    key=f"calendar_download_{index}",
+                    use_container_width=True,
+                )
         markdown_result = render_markdown(result)
         json_result = result_to_json(result)
         markdown_col, json_col = st.columns(2)
