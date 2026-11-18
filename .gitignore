@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+changli-noticlean.zip
+run-error.log
+build/
+dist/
+.env
+.env.*
