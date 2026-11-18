@@ -151,21 +151,6 @@ def _apply_countdown(deadline: DeadlineInfo, reference: datetime) -> None:
         deadline.urgency = "⏳ 时间充裕"
 
 
-def make_deadline(value: datetime, reference: datetime, raw_text: str = "", date_only: bool = False) -> DeadlineInfo:
-    if value.tzinfo is not None:
-        raise ValueError("日历时间必须是不含时区的本地时间")
-    if date_only:
-        value = value.replace(hour=23, minute=59, second=0, microsecond=0)
-    deadline = DeadlineInfo(
-        raw_text=raw_text or value.isoformat(),
-        value=value,
-        date_only=date_only,
-        year_inferred=False,
-    )
-    _apply_countdown(deadline, reference)
-    return deadline
-
-
 def parse_deadline(text: str, reference: datetime) -> DeadlineInfo:
     candidates = _candidates(text, reference)
     if not candidates:

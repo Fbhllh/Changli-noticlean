@@ -6,14 +6,7 @@ from datetime import datetime
 from urllib.parse import urlsplit
 
 from noticlean.dates import parse_deadline
-from noticlean.models import (
-    CATEGORY_OPTIONS,
-    DEFAULT_PRIORITY,
-    PRIORITY_OPTIONS,
-    DeadlineInfo,
-    NoticeCard,
-    ParseResult,
-)
+from noticlean.models import NoticeCard, ParseResult
 
 SAFETY_WARNING = "检测到该通知可能涉及非官方收费或敏感链接，请务必通过学校官网或官方渠道二次核实，谨防受骗！"
 MISSING_AUDIENCE = "未在通知中找到明确面向对象，建议向发通知的老师/班长二次确认！"
@@ -32,25 +25,6 @@ _CAMPUS_WORDS = re.compile(r"长理|长沙理工|学校|学院|大学|校区|云
 _NOTICE_WORDS = re.compile(r"通知|报名|截止|提交|参加|集合|填写|讲座|比赛|考试|补测|答疑|材料|群号|选课|答辩")
 _URL = re.compile(r"https?://[^\s<>\[\]【】\"'，。；！、]+", re.IGNORECASE)
 _SHORT_HOSTS = {"t.cn", "url.cn", "dwz.cn", "bit.ly", "tinyurl.com", "suo.im", "shorturl.at"}
-
-
-def _classify_category(text: str) -> str:
-    if re.search(r"教务|选课|学分|绩点|成绩|补考|缓考|考试|课程|毕业审核|学籍", text):
-        return CATEGORY_OPTIONS[0]
-    if re.search(r"讲座|比赛|竞赛|大赛|论坛|沙龙", text):
-        return CATEGORY_OPTIONS[2]
-    if re.search(r"学院|班级|辅导员|团支部|班会|年级", text):
-        return CATEGORY_OPTIONS[1]
-    return CATEGORY_OPTIONS[3]
-
-
-def resolve_priority(priority: str, deadline: DeadlineInfo, source_text: str, reference: datetime) -> str:
-    normalized = priority if priority in PRIORITY_OPTIONS else DEFAULT_PRIORITY
-    if re.search(r"绩点|考试|补考|缓考|成绩|选课", source_text):
-        return PRIORITY_OPTIONS[0]
-    if deadline.value is not None and (deadline.value - reference).total_seconds() <= 172800:
-        return PRIORITY_OPTIONS[0]
-    return normalized
 
 
 def _unique(items: list[str]) -> list[str]:
@@ -181,6 +155,19 @@ def split_notices(text: str) -> list[str]:
     return chunks or [stripped]
 
 
+_EVENT_TERM = re.compile(
+    r"大赛|比赛|竞赛|讲座|活动|会议|考试|体测|补测|答疑|答辩|招聘|征集|选拔|培训|展览|演出|沙龙|论坛|晚会|课程|实践|赛"
+)
+_GENERIC_EVENT_HEADING = re.compile(
+    r"^(?:【)?(?:重要|紧急|校园|群)?通知(?:】)?[!！。]?$"
+)
+_EVENT_IN_BODY = re.compile(
+    r"(?:举办|开展|举行|组织)\s*"
+    r"([^，。；;：:\n]{2,48}?(?:大赛|比赛|竞赛|讲座|活动|会议|考试|体测|补测|答疑|答辩|招聘会|招聘|征集|选拔|培训|展览|演出|沙龙|论坛|晚会|赛))"
+    r"(?=$|[，,。；;])"
+)
+
+
 def _short_title(value: str) -> str:
     title = re.sub(r"^[@＠]所有人\s*", "", value.strip())
     title = re.sub(r"^(?:各位|亲爱的)(?:老师|同学|同学们|大家)[，,:：\s]*", "", title)
@@ -203,13 +190,24 @@ def _extract_event(text: str) -> str:
         if bracketed and not re.fullmatch(r"(?:重要|紧急|校园|群)?通知", bracketed.group(1)):
             return _short_title(bracketed.group(1))
     for line in lines:
-        if re.fullmatch(r"(?:重要|紧急|校园|群)?通知[!！。]?", line):
+        body_event = _EVENT_IN_BODY.search(line)
+        if body_event:
+            return _short_title(body_event.group(1))
+    for line in lines:
+        if _GENERIC_EVENT_HEADING.fullmatch(line):
             continue
         if re.fullmatch(r"(?:@所有人|各位同学|同学们|大家好|请查收)[:：，,!！。\s]*", line):
             continue
+        if re.match(r"^(?:截止时间|截止日期|时间|地点|活动地点|面向对象|参与对象|活动对象|报名对象|适用对象|对象|链接|平台)\s*[:：]", line):
+            continue
+        if "http" in line.lower():
+            continue
         title = _short_title(line)
-        if title:
-            return title
+        if not title or not _EVENT_TERM.search(title):
+            continue
+        if re.match(r"^(?:请|务必|应于|逾期|点击|填写|提交|加入|登录|携带|准备|上传|发送)", title):
+            continue
+        return title
     return MISSING_EVENT
 
 
@@ -217,47 +215,81 @@ def _extract_audience(text: str) -> str:
     explicit = re.search(r"(?:面向对象|参与对象|活动对象|报名对象|适用对象|对象)[:：]\s*([^\n。；]{2,80})", text)
     if explicit:
         return explicit.group(1).strip(" ，,")
+    people = r"(?:学生|同学|本科生|研究生|应届毕业生|毕业生)"
     patterns = [
-        r"(?:长理|长沙理工)?全体(?:在校)?(?:学生|同学)",
-        r"全校(?:在校)?(?:学生|同学)",
-        r"(?:20\d{2}级|大[一二三四五六]|[一二三四五六]年级)[^，。；\n]{0,24}?(?:学生|同学|本科生|研究生)",
-        r"[\u4e00-\u9fff]{2,14}(?:学院|专业)(?:的)?(?:全体)?(?:学生|同学|本科生|研究生)",
+        r"(?:长理|长沙理工)?全体(?:在校)?" + people,
+        r"全校(?:全体)?(?:在校)?" + people,
+        r"[\u4e00-\u9fff]{2,14}学院(?:20\d{2}级|大[一二三四五六]|[一二三四五六]年级)?(?:的)?(?:全体)?(?:在校)?" + people,
+        r"[\u4e00-\u9fff]{2,14}(?:、[\u4e00-\u9fff]{1,12})*(?:等[\u4e00-\u9fff]{0,8})?专业(?:的)?(?:全体)?(?:在校)?" + people,
+        r"(?:20\d{2}级|大[一二三四五六]|[一二三四五六]年级)[^，。；\n]{0,24}?" + people,
         r"(?:本科生|研究生|应届毕业生|毕业生|团支书|班长|学习委员)",
     ]
-    matches = []
+    spans = []
     for pattern in patterns:
-        matches.extend(match.group(0) for match in re.finditer(pattern, text))
-    return "；".join(_unique(matches)) if matches else MISSING_AUDIENCE
+        spans.extend((match.start(), match.end(), match.group(0)) for match in re.finditer(pattern, text))
+    spans = list(dict.fromkeys(spans))
+    kept = []
+    for start, end, value in spans:
+        contained = any(
+            (other_start, other_end) != (start, end)
+            and other_start <= start
+            and end <= other_end
+            and other_end - other_start > end - start
+            for other_start, other_end, _ in spans
+        )
+        if not contained:
+            kept.append((start, end, value))
+    kept.sort(key=lambda item: (item[0], item[1]))
+    matches = _unique([value for _, _, value in kept])
+    return "；".join(matches) if matches else MISSING_AUDIENCE
+
+
+def _clean_location_candidate(value: str) -> str:
+    cleaned = value.strip()
+    cleaned = re.sub(r"^(?:(?:活动|集合|会议|提交|报名)?地点|场所)(?:在|为|是)", "", cleaned)
+    cleaned = re.sub(r"^(?:请)?(?:大家)?(?:到|去|在)", "", cleaned)
+    return cleaned.strip(" ，,：:")
 
 
 def _extract_location(text: str, links: list[str]) -> str:
     explicit = re.search(r"(?:活动地点|集合地点|提交地点|报名地点|会议地点|线上平台|平台|地点)[:：]\s*([^\n。；]{2,100})", text)
     if explicit:
         return explicit.group(1).strip(" ，,")
+    suffix = r"(?:[一二三四五六七八九十\d]+(?:楼|层)|[A-Za-z]?\d{1,5}[A-Za-z]?)?"
     campus_pattern = re.compile(
         r"(?:云塘|金盆岭|金村)(?:校区)?"
         r"(?:[A-Za-z]?\d+[A-Za-z]?摊位|"
-        r"[\u4e00-\u9fff]{0,12}?(?:教学楼|实验楼|图书馆|体育馆|报告厅|会议室|教室|田径场|篮球场|足球场|操场|楼|馆|中心)"
-        r"(?:[A-Za-z]?\d{1,5}[A-Za-z]?|[一二三四五六七八九十\d]+楼)?)"
+        r"[A-Za-z0-9]{1,8}教(?:学楼)?[A-Za-z0-9-]{0,8}|"
+        r"[\u4e00-\u9fff]{0,12}(?:教学楼|实验楼|图书馆|体育馆|报告厅|会议室|教室|田径场|篮球场|足球场|操场|楼|馆|中心)" + suffix + r")"
     )
-    campuses = _unique([match.group(0) for match in campus_pattern.finditer(text)])
+    campuses = _unique([
+        _clean_location_candidate(match.group(0))
+        for match in campus_pattern.finditer(text)
+    ])
     if campuses:
         return "；".join(campuses)
+    rooms = _unique([
+        _clean_location_candidate(match.group(0))
+        for match in re.finditer(
+            r"[\u4e00-\u9fff]{0,12}(?:教学楼|实验楼|图书馆|体育馆|报告厅|会议室|教室)[\u4e00-\u9fffA-Za-z0-9_-]{0,16}",
+            text,
+        )
+    ])
+    if rooms:
+        return "；".join(rooms)
     campus_names = _unique([
         match.group(0)
         for match in re.finditer(r"(?:云塘|金盆岭|金村)(?:校区)?", text)
     ])
     if campus_names:
         return "；".join(campus_names)
-    rooms = _unique([
-        match.group(0)
-        for match in re.finditer(r"[\u4e00-\u9fff]{2,12}(?:教学楼|实验楼|图书馆|体育馆|报告厅|会议室|教室)[\u4e00-\u9fffA-Za-z0-9_-]{0,16}", text)
-    ])
-    if rooms:
-        return "；".join(rooms)
     platforms = _unique([
         match.group(0)
-        for match in re.finditer(r"腾讯会议(?:号)?[\d -]{5,}|学习通|雨课堂|超星|中国大学MOOC|华为官方赛事平台|线上平台", text, re.IGNORECASE)
+        for match in re.finditer(
+            r"腾讯会议(?:号)?\s*[:：]?\s*\d[\d -]{4,}|学习通|雨课堂|超星|中国大学MOOC|华为官方赛事平台|线上平台",
+            text,
+            re.IGNORECASE,
+        )
     ])
     if platforms:
         return "；".join(platforms)
@@ -302,7 +334,6 @@ def _build_tip(text: str, card: NoticeCard, has_risk: bool) -> str:
 
 def _parse_notice(text: str, reference: datetime, has_risk: bool) -> NoticeCard:
     links = extract_links(text)
-    default_priority = PRIORITY_OPTIONS[2] if re.search(r"自愿|讲座|社团|招新", text) else DEFAULT_PRIORITY
     card = NoticeCard(
         event_name=_extract_event(text),
         deadline=parse_deadline(text, reference),
@@ -312,11 +343,8 @@ def _parse_notice(text: str, reference: datetime, has_risk: bool) -> NoticeCard:
         links=links,
         tip="",
         source_text=text,
-        category=_classify_category(text),
-        priority=default_priority,
     )
     card.tip = _build_tip(text, card, has_risk)
-    card.priority = resolve_priority(card.priority, card.deadline, text, reference)
     return card
 
 
