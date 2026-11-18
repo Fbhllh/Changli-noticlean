@@ -4,76 +4,10 @@ import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Literal
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
-
-from noticlean.dates import make_deadline
-from noticlean.models import DEFAULT_CATEGORY, DEFAULT_PRIORITY, ParseResult
-from noticlean.parser import resolve_priority
-
-Category = Literal["教务通知", "院系/班级", "讲座/比赛", "社团/其他"]
-Priority = Literal[
-    "高-红标（涉及绩点/考试/截止日期在48小时内）",
-    "中-黄标（常规通知）",
-    "低-绿标（自愿参加/讲座等）",
-]
-
-SYSTEM_PROMPT = """你是严谨的校园通知结构化提取器。只输出一个 JSON 对象，不要 Markdown、代码围栏或解释。
-必须保留输入通知的数量和顺序。无法确认的文本字段返回空字符串，行动返回空数组，时间返回 null，禁止编造。
-event_time 必须是不含时区的 ISO 本地时间：精确时间使用 YYYY-MM-DDTHH:mm:ss；只有日期使用 YYYY-MM-DD，并令 date_only=true。
-category 只能是：教务通知、院系/班级、讲座/比赛、社团/其他。
-priority 只能是：高-红标（涉及绩点/考试/截止日期在48小时内）、中-黄标（常规通知）、低-绿标（自愿参加/讲座等）。
-绩点、考试或截止不超过48小时为高优先级；自愿参加、普通讲座且无紧迫截止可为低优先级；其余常规通知为中优先级。"""
-
-
-class LLMNotice(BaseModel):
-    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
-
-    event_name: str = Field(default="", max_length=200)
-    event_time: datetime | None = None
-    date_only: bool = False
-    audience: str = Field(default="", max_length=300)
-    location: str = Field(default="", max_length=300)
-    actions: list[str] = Field(default_factory=list, max_length=10)
-    tip: str = Field(default="", max_length=300)
-    category: Category = DEFAULT_CATEGORY
-    priority: Priority = DEFAULT_PRIORITY
-
-    @field_validator("event_time", mode="before")
-    @classmethod
-    def normalize_event_time(cls, value: object) -> object:
-        if value is None or value == "":
-            return None
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                return None
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
-                return text + "T23:59:00"
-            return text
-        return value
-
-    @field_validator("event_time")
-    @classmethod
-    def require_local_time(cls, value: datetime | None) -> datetime | None:
-        if value is not None and value.tzinfo is not None:
-            raise ValueError("event_time 必须是不含时区的本地时间")
-        return value
-
-    @field_validator("actions")
-    @classmethod
-    def remove_empty_actions(cls, value: list[str]) -> list[str]:
-        return [item for item in value if item]
-
-
-class LLMResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    notices: list[LLMNotice]
+from noticlean.models import ParseResult
 
 
 @dataclass(frozen=True)
@@ -113,28 +47,14 @@ def _decode_content(raw: bytes) -> dict:
     return result
 
 
-def _request_enhancement(result: ParseResult, config: LLMConfig, reference: datetime) -> dict:
+def _request_enhancement(result: ParseResult, config: LLMConfig) -> dict:
     if not config.model.strip():
         raise ValueError("模型名称不能为空")
     local_cards = [notice.to_dict() for notice in result.notices]
-    example = {
-        "notices": [{
-            "event_name": "示例讲座",
-            "event_time": "2026-11-20T18:00:00",
-            "date_only": False,
-            "audience": "全体学生",
-            "location": "云塘校区图书馆报告厅",
-            "actions": ["提前报名并按时参加"],
-            "tip": "提前保存报名凭证",
-            "category": "讲座/比赛",
-            "priority": "低-绿标（自愿参加/讲座等）",
-        }]
-    }
     prompt = "\n".join([
-        f"参考本地时间：{reference.isoformat(timespec='minutes')}。解析相对日期时以此为基准。",
-        "返回结构示例，仅用于说明字段类型，不要把示例内容带入结果：",
-        json.dumps(example, ensure_ascii=False),
-        f"必须返回 {len(local_cards)} 条 notices，并保持原有顺序。",
+        "请从校园通知中补充或修正结构化字段，只返回 JSON 对象。",
+        '格式为 {"notices":[{"event_name":"...","audience":"...","location":"...","actions":["..."],"tip":"..."}]}。',
+        "notices 的顺序和数量必须与本地卡片一致。无法确认的字段返回空字符串或空数组，禁止编造时间、地点、对象、链接或行动。",
         "原始通知：",
         result.cleaned_text,
         "本地卡片：",
@@ -143,7 +63,7 @@ def _request_enhancement(result: ParseResult, config: LLMConfig, reference: date
     body = json.dumps({
         "model": config.model.strip(),
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": "你是严谨的校园通知信息提取器，只输出指定 JSON。"},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0,
@@ -160,34 +80,32 @@ def _request_enhancement(result: ParseResult, config: LLMConfig, reference: date
     return _decode_content(raw)
 
 
-def enhance_result(result: ParseResult, config: LLMConfig, reference: datetime | None = None) -> ParseResult:
+def _clean_text_field(value: object, limit: int = 500) -> str:
+    return value.strip()[:limit] if isinstance(value, str) else ""
+
+
+def enhance_result(result: ParseResult, config: LLMConfig) -> ParseResult:
     if not result.relevant or not result.notices:
         return result
-    actual_reference = reference or datetime.now()
     try:
-        payload = _request_enhancement(result, config, actual_reference)
-        response = LLMResponse.model_validate(payload)
-        if len(response.notices) != len(result.notices):
-            raise ValueError("模型返回的通知数量与本地解析结果不一致")
+        payload = _request_enhancement(result, config)
+        items = payload.get("notices")
+        if not isinstance(items, list):
+            raise ValueError("模型响应缺少 notices 数组")
         enhanced = deepcopy(result)
-        for card, item in zip(enhanced.notices, response.notices):
+        for card, item in zip(enhanced.notices, items):
+            if not isinstance(item, dict):
+                continue
             for field_name in ("event_name", "audience", "location", "tip"):
-                value = getattr(item, field_name)
+                value = _clean_text_field(item.get(field_name))
                 if value:
                     setattr(card, field_name, value)
-            if item.actions:
-                card.actions = item.actions
-            card.category = item.category
-            card.calendar_ready = False
-            if item.event_time is not None:
-                card.deadline = make_deadline(
-                    item.event_time,
-                    actual_reference,
-                    item.event_time.isoformat(),
-                    item.date_only,
-                )
-                card.calendar_ready = bool(item.event_name and item.location)
-            card.priority = resolve_priority(item.priority, card.deadline, card.source_text, actual_reference)
+            actions = item.get("actions")
+            if isinstance(actions, list):
+                cleaned_actions = [_clean_text_field(action) for action in actions[:10]]
+                cleaned_actions = [action for action in cleaned_actions if action]
+                if cleaned_actions:
+                    card.actions = cleaned_actions
         return enhanced
     except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError):
         failed = deepcopy(result)
