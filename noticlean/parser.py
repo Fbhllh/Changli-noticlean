@@ -6,7 +6,14 @@ from datetime import datetime
 from urllib.parse import urlsplit
 
 from noticlean.dates import parse_deadline
-from noticlean.models import NoticeCard, ParseResult
+from noticlean.models import (
+    CATEGORY_OPTIONS,
+    DEFAULT_PRIORITY,
+    PRIORITY_OPTIONS,
+    DeadlineInfo,
+    NoticeCard,
+    ParseResult,
+)
 
 SAFETY_WARNING = "检测到该通知可能涉及非官方收费或敏感链接，请务必通过学校官网或官方渠道二次核实，谨防受骗！"
 MISSING_AUDIENCE = "未在通知中找到明确面向对象，建议向发通知的老师/班长二次确认！"
@@ -25,6 +32,25 @@ _CAMPUS_WORDS = re.compile(r"长理|长沙理工|学校|学院|大学|校区|云
 _NOTICE_WORDS = re.compile(r"通知|报名|截止|提交|参加|集合|填写|讲座|比赛|考试|补测|答疑|材料|群号|选课|答辩")
 _URL = re.compile(r"https?://[^\s<>\[\]【】\"'，。；！、]+", re.IGNORECASE)
 _SHORT_HOSTS = {"t.cn", "url.cn", "dwz.cn", "bit.ly", "tinyurl.com", "suo.im", "shorturl.at"}
+
+
+def _classify_category(text: str) -> str:
+    if re.search(r"教务|选课|学分|绩点|成绩|补考|缓考|考试|课程|毕业审核|学籍", text):
+        return CATEGORY_OPTIONS[0]
+    if re.search(r"讲座|比赛|竞赛|大赛|论坛|沙龙", text):
+        return CATEGORY_OPTIONS[2]
+    if re.search(r"学院|班级|辅导员|团支部|班会|年级", text):
+        return CATEGORY_OPTIONS[1]
+    return CATEGORY_OPTIONS[3]
+
+
+def resolve_priority(priority: str, deadline: DeadlineInfo, source_text: str, reference: datetime) -> str:
+    normalized = priority if priority in PRIORITY_OPTIONS else DEFAULT_PRIORITY
+    if re.search(r"绩点|考试|补考|缓考|成绩|选课", source_text):
+        return PRIORITY_OPTIONS[0]
+    if deadline.value is not None and (deadline.value - reference).total_seconds() <= 172800:
+        return PRIORITY_OPTIONS[0]
+    return normalized
 
 
 def _unique(items: list[str]) -> list[str]:
@@ -276,6 +302,7 @@ def _build_tip(text: str, card: NoticeCard, has_risk: bool) -> str:
 
 def _parse_notice(text: str, reference: datetime, has_risk: bool) -> NoticeCard:
     links = extract_links(text)
+    default_priority = PRIORITY_OPTIONS[2] if re.search(r"自愿|讲座|社团|招新", text) else DEFAULT_PRIORITY
     card = NoticeCard(
         event_name=_extract_event(text),
         deadline=parse_deadline(text, reference),
@@ -285,8 +312,11 @@ def _parse_notice(text: str, reference: datetime, has_risk: bool) -> NoticeCard:
         links=links,
         tip="",
         source_text=text,
+        category=_classify_category(text),
+        priority=default_priority,
     )
     card.tip = _build_tip(text, card, has_risk)
+    card.priority = resolve_priority(card.priority, card.deadline, text, reference)
     return card
 
 

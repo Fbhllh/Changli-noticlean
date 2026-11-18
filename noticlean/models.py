@@ -4,6 +4,15 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
+CATEGORY_OPTIONS = ("教务通知", "院系/班级", "讲座/比赛", "社团/其他")
+PRIORITY_OPTIONS = (
+    "高-红标（涉及绩点/考试/截止日期在48小时内）",
+    "中-黄标（常规通知）",
+    "低-绿标（自愿参加/讲座等）",
+)
+DEFAULT_CATEGORY = CATEGORY_OPTIONS[3]
+DEFAULT_PRIORITY = PRIORITY_OPTIONS[1]
+
 
 @dataclass
 class DeadlineInfo:
@@ -30,6 +39,9 @@ class NoticeCard:
     links: list[str]
     tip: str
     source_text: str
+    category: str = DEFAULT_CATEGORY
+    priority: str = DEFAULT_PRIORITY
+    calendar_ready: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -40,6 +52,8 @@ class NoticeCard:
             "actions": list(self.actions),
             "links": list(self.links),
             "tip": self.tip,
+            "category": self.category,
+            "priority": self.priority,
         }
 
 
